@@ -21,6 +21,7 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
+import java.nio.file.AccessDeniedException;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
@@ -30,6 +31,7 @@ import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
 
+import com.google.common.annotations.VisibleForTesting;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import com.google.common.util.concurrent.ListeningExecutorService;
@@ -53,6 +55,8 @@ import org.apache.hadoop.io.retry.RetryProxy;
 import org.apache.hadoop.util.BlockingThreadPoolExecutorService;
 import org.apache.hadoop.util.Progressable;
 
+import javax.annotation.Nullable;
+
 /**
  * The core CosN Filesystem implementation.
  */
@@ -73,12 +77,28 @@ public class CosNFileSystem extends FileSystem {
 
   private ListeningExecutorService boundedIOThreadPool;
   private ListeningExecutorService boundedCopyThreadPool;
+  private COSInstrumentation instrumentation;
 
   public CosNFileSystem() {
   }
 
   public CosNFileSystem(NativeFileSystemStore store) {
     this.store = store;
+  }
+
+  public NativeFileSystemStore getWriteOperationHelper() {
+    return store;
+  }
+
+  /**
+   * Create a new instance of the committer statistics
+   */
+  public COSInstrumentation.CommitterStatistics newCommitterStatistics() {
+    return instrumentation.newCommitterStatistics();
+  }
+
+  public COSInstrumentation getInstrumentation() {
+    return instrumentation;
   }
 
   /**
@@ -110,6 +130,7 @@ public class CosNFileSystem extends FileSystem {
     LOG.debug("owner:" + owner + ", group:" + group);
 
     BufferPool.getInstance().initialize(this.getConf());
+    instrumentation = new COSInstrumentation(uri);
 
     // initialize the thread pool
     int uploadThreadPoolSize = this.getConf().getInt(
@@ -196,7 +217,7 @@ public class CosNFileSystem extends FileSystem {
     return ownerInfoId;
   }
 
-  private static String pathToKey(Path path) {
+  public static String pathToKey(Path path) {
     if (path.toUri().getScheme() != null && path.toUri().getPath().isEmpty()) {
       // allow uris without trailing slash after bucket to refer to root,
       // like cosn://mybucket
@@ -218,13 +239,100 @@ public class CosNFileSystem extends FileSystem {
     } else {
       return new Path(key);
     }
+  }/**
+   * Convert a key to a fully qualified path.
+   * This includes fixing up the URI so that if it ends with a trailing slash,
+   * that is corrected, similar to {@code Path.normalizePath()}.
+   * @param key input key
+   * @return the fully qualified path including URI scheme and bucket name.
+   */
+  public Path keyToQualifiedPath(String key) {
+    return qualify(keyToPath(key));
   }
+
+  @Override
+  public Path makeQualified(final Path path) {
+    Path q = super.makeQualified(path);
+    if (!q.isRoot()) {
+      String urlString = q.toUri().toString();
+      if (urlString.endsWith(Path.SEPARATOR)) {
+        // this is a path which needs root stripping off to avoid
+        // confusion, See HADOOP-15430
+        LOG.debug("Stripping trailing '/' from {}", q);
+        // deal with an empty "/" at the end by mapping to the parent and
+        // creating a new path from it
+        q = new Path(urlString.substring(0, urlString.length() - 1));
+      }
+    }
+    if (!q.isRoot() && q.getName().isEmpty()) {
+      q = q.getParent();
+    }
+    return q;
+  }
+
+  /**
+   * Qualify a path.
+   * This includes fixing up the URI so that if it ends with a trailing slash,
+   * that is corrected, similar to {@code Path.normalizePath()}.
+   * @param path path to qualify
+   * @return a qualified path.
+   */
+  public Path qualify(Path path) {
+    return makeQualified(path);
+  }
+
+  /**
+   * Revert a commit by deleting the file.
+   * Relies on retry code in filesystem
+   * @throws IOException on problems
+   * @param destKey destination key
+   */
+  public void revertCommit(String destKey) throws IOException {
+    // todo:s3a use the invoker once to execute this opration, must be notice that
+    // the keyToQualifiedPath seems to be used in meta view.
+    Path destPath = keyToQualifiedPath(destKey);
+    store.delete(destKey);
+    maybeCreateFakeParentDirectory(destPath);
+  }
+
+  public void maybeCreateFakeParentDirectory(Path destPath) throws IOException {
+    Path parent = destPath.getParent();
+    if (parent != null) {
+      createFakeDirectoryIfNecessary(parent);
+    }
+  }
+
+  private void createFakeDirectoryIfNecessary(Path f) throws IOException {
+    String key = pathToKey(f);
+    // we only make the LIST call; the codepaths to get here should not
+    // be reached if there is an empty dir marker -and if they do, it
+    // is mostly harmless to create a new one.
+    //if (!key.isEmpty() && !s3Exists(f, EnumSet.of(StatusProbeEnum.List))) {
+    if (!key.isEmpty()) {
+      LOG.debug("Creating new fake directory at {}", f);
+      createFakeDirectory(key);
+    }
+  }
+
+  private void createFakeDirectory(final String objectName)
+          throws IOException {
+    if (!objectName.endsWith("/")) {
+      store.storeEmptyFile(objectName + "/");
+    } else {
+      store.storeEmptyFile(objectName);
+    }
+  }
+
 
   private Path makeAbsolute(Path path) {
     if (path.isAbsolute()) {
       return path;
     }
     return new Path(workingDir, path);
+  }
+
+  public String getBucket() {
+    return bucket;
   }
 
   /**
@@ -397,6 +505,11 @@ public class CosNFileSystem extends FileSystem {
   @Override
   public URI getUri() {
     return uri;
+  }
+
+  @VisibleForTesting
+  public String getBucketLocation() throws IOException  {
+       return store.getBucketLocation();
   }
 
   /**

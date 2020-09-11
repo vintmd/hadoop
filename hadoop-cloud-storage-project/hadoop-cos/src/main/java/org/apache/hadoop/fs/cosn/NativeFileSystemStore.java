@@ -25,6 +25,9 @@ import java.util.List;
 
 import com.qcloud.cos.model.CompleteMultipartUploadResult;
 import com.qcloud.cos.model.PartETag;
+import com.qcloud.cos.model.MultipartUpload;
+import com.qcloud.cos.model.UploadPartRequest;
+import com.qcloud.cos.model.UploadPartResult;
 
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
@@ -35,9 +38,9 @@ import org.apache.hadoop.conf.Configuration;
  * An abstraction for a key-based {@link File} store.
  * </p>
  */
-@InterfaceAudience.Private
+@InterfaceAudience.Public
 @InterfaceStability.Stable
-interface NativeFileSystemStore {
+public interface NativeFileSystemStore {
 
   void initialize(URI uri, Configuration conf) throws IOException;
 
@@ -51,7 +54,7 @@ interface NativeFileSystemStore {
   CompleteMultipartUploadResult completeMultipartUpload(
       String key, String uploadId, List<PartETag> partETagList);
 
-  void abortMultipartUpload(String key, String uploadId);
+  void abortMultipartUpload(String key, String uploadId) throws IOException;
 
   String getUploadId(String key);
 
@@ -80,6 +83,21 @@ interface NativeFileSystemStore {
   void delete(String key) throws IOException;
 
   void copy(String srcKey, String dstKey) throws IOException;
+
+  String getBucketLocation() throws IOException;
+
+  // blow functions are used for commit operations
+  List<MultipartUpload> listMultipartUploads(String prefix) throws IOException;
+
+  int abortMultipartUploadsUnderPath(String prefix) throws IOException;
+
+  String initiateMultiPartUpload(String destKey) throws IOException;
+
+  UploadPartRequest newUploadPartRequest(String destKey, String uploadId, int partNumber,
+                                         int size, InputStream uploadStream,
+                                         File sourceFile, Long offset) throws IOException;
+
+  UploadPartResult uploadPart(UploadPartRequest request) throws IOException;
 
   /**
    * Delete all keys with the given prefix. Used for testing.

@@ -40,4 +40,27 @@ public final class Constants {
 
   public static final String COSN_SECRET_ID_ENV = "COSN_SECRET_ID";
   public static final String COSN_SECRET_KEY_ENV = "COSN_SECRET_KEY";
+
+  // The committer constants
+  public static final String BUFFER_DIR = "fs.cos.buffer.dir";
+  public static final String HADOOP_TMP_DIR = "hadoop.tmp.dir";
+
+  public static final String COS_METADATA_STORE_IMPL =
+          "fs.cos.metadatastore.impl";
+
+  public static final String METADATASTORE_AUTHORITATIVE =
+          "fs.cos.metadatastore.authoritative";
+
+  public static final String AUTHORITATIVE_PATH = "fs.cos.authoritative.path";
+
+  /**
+   * How long to wait for the thread pool to terminate when cleaning up.
+   * Value: {@value} seconds.
+   */
+  public static final int THREAD_POOL_SHUTDOWN_DELAY_SECONDS = 30;
+
+  // size of each of or multipart pieces in bytes
+  public static final String MULTIPART_SIZE = "fs.cosn.block.size";
+  public static final long DEFAULT_MULTIPART_SIZE = 8 * Unit.MB; // 64M
+
 }

@@ -17,17 +17,9 @@
  */
 package org.apache.hadoop.fs.cosn;
 
-import java.io.BufferedInputStream;
-import java.io.ByteArrayInputStream;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.IOException;
-import java.io.InputStream;
+import java.io.*;
 import java.net.URI;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.List;
+import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 
 import com.qcloud.cos.COSClient;
@@ -38,25 +30,7 @@ import com.qcloud.cos.endpoint.SuffixEndpointBuilder;
 import com.qcloud.cos.exception.CosClientException;
 import com.qcloud.cos.exception.CosServiceException;
 import com.qcloud.cos.http.HttpProtocol;
-import com.qcloud.cos.model.AbortMultipartUploadRequest;
-import com.qcloud.cos.model.COSObject;
-import com.qcloud.cos.model.COSObjectSummary;
-import com.qcloud.cos.model.CompleteMultipartUploadRequest;
-import com.qcloud.cos.model.CompleteMultipartUploadResult;
-import com.qcloud.cos.model.CopyObjectRequest;
-import com.qcloud.cos.model.DeleteObjectRequest;
-import com.qcloud.cos.model.GetObjectMetadataRequest;
-import com.qcloud.cos.model.GetObjectRequest;
-import com.qcloud.cos.model.InitiateMultipartUploadRequest;
-import com.qcloud.cos.model.InitiateMultipartUploadResult;
-import com.qcloud.cos.model.ListObjectsRequest;
-import com.qcloud.cos.model.ObjectListing;
-import com.qcloud.cos.model.ObjectMetadata;
-import com.qcloud.cos.model.PartETag;
-import com.qcloud.cos.model.PutObjectRequest;
-import com.qcloud.cos.model.PutObjectResult;
-import com.qcloud.cos.model.UploadPartRequest;
-import com.qcloud.cos.model.UploadPartResult;
+import com.qcloud.cos.model.*;
 import com.qcloud.cos.region.Region;
 import com.qcloud.cos.utils.Base64;
 import org.slf4j.Logger;
@@ -68,6 +42,9 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.cosn.auth.COSCredentialsProviderList;
 import org.apache.hadoop.util.VersionInfo;
 import org.apache.http.HttpStatus;
+
+import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Preconditions.checkNotNull;
 
 /**
  * The class actually performs access operation to the COS blob store.
@@ -152,6 +129,136 @@ class CosNativeFileSystemStore implements NativeFileSystemStore {
     } catch (Exception e) {
       handleException(e, "");
     }
+  }
+
+  // blow multi upload part is used for cos committer
+  public String getBucketLocation() throws IOException {
+      return getBucketLocation(bucketName);
+  }
+
+  public String getBucketLocation(String bucketName) throws IOException {
+      final String region = cosClient.getBucketLocation(bucketName);
+      return region;
+  }
+
+  // blow used for commit operations
+  public List<MultipartUpload> listMultipartUploads(String prefix) throws IOException {
+    ListMultipartUploadsRequest request = new ListMultipartUploadsRequest(
+            bucketName);
+    if (!prefix.isEmpty()) {
+      if (!prefix.endsWith("/")) {
+        prefix = prefix + "/";
+      }
+      request.setPrefix(prefix);
+    }
+    MultipartUploadListing result = null;
+    try {
+      result = (MultipartUploadListing) callCOSClientWithRetry(request);
+      LOG.debug("list multi part upload successfully. COS prefix: [{}]", prefix);
+    } catch (Exception e) {
+      String errMsg = String.format("list multi part upload failed. "
+              + "COS prefix: [%s], exception: [%s]", prefix, e.toString());
+      LOG.error(errMsg);
+      handleException(new Exception(errMsg), prefix);
+    }
+    return result.getMultipartUploads();
+  }
+
+  public int abortMultipartUploadsUnderPath(String prefix) throws IOException {
+    LOG.debug("Aborting multipart uploads under {}", prefix);
+    int count = 0;
+    List<MultipartUpload> multipartUploads = listMultipartUploads(prefix);
+    LOG.debug("Number of outstanding uploads: {}", multipartUploads.size());
+    for (MultipartUpload upload: multipartUploads) {
+      try {
+        abortMultipartUpload(upload.getKey(), upload.getUploadId());
+        count++;
+      } catch (FileNotFoundException e) {
+        LOG.debug("Already aborted: {}", upload.getKey(), e);
+      }
+    }
+    return count;
+  }
+
+  public ObjectMetadata newObjectMetadata(long length) {
+    final ObjectMetadata om = new ObjectMetadata();
+    if (length >= 0) {
+      om.setContentLength(length);
+    }
+    return om;
+  }
+
+  public String initiateMultiPartUpload(String destKey) throws IOException {
+    LOG.debug("Initiating Multipart upload to {}", destKey);
+    final InitiateMultipartUploadRequest initiateMPURequest =
+            new InitiateMultipartUploadRequest(bucketName,
+                    destKey,
+                    newObjectMetadata(-1));
+    // todo can add other securt header or acl
+    // initiateMPURequest.setCannedACL(getCannedACL());
+    // setOptionalMultipartUploadRequestParameters(initiateMPURequest);
+    InitiateMultipartUploadResult result = null;
+    try {
+      result = (InitiateMultipartUploadResult) callCOSClientWithRetry(initiateMPURequest);
+      LOG.debug("list multi part upload successfully. COS dst key: [{}]", destKey);
+    } catch (Exception e) {
+      String errMsg = String.format("list multi part upload failed. "
+              + "COS dst key: [%s], exception: [%s]", destKey, e.toString());
+      LOG.error(errMsg);
+      handleException(new Exception(errMsg), destKey);
+    }
+    return result.getUploadId();
+  }
+
+  public UploadPartRequest newUploadPartRequest(String destKey, String uploadId, int partNumber,
+                                         int size, InputStream uploadStream,
+                                         File sourceFile, Long offset) throws IOException {
+    checkNotNull(uploadId);
+    // exactly one source must be set; xor verifies this
+    checkArgument((uploadStream != null) ^ (sourceFile != null),
+            "Data source");
+    checkArgument(size >= 0, "Invalid partition size %s", size);
+    checkArgument(partNumber > 0 && partNumber <= 10000,
+            "partNumber must be between 1 and 10000 inclusive, but is %s",
+            partNumber);
+
+    LOG.debug("Creating part upload request for {} #{} size {}",
+            uploadId, partNumber, size);
+    UploadPartRequest request = new UploadPartRequest()
+            .withBucketName(bucketName)
+            .withKey(destKey)
+            .withUploadId(uploadId)
+            .withPartNumber(partNumber)
+            .withPartSize(size);
+    if (uploadStream != null) {
+      // there's an upload stream. Bind to it.
+      request.setInputStream(uploadStream);
+    } else {
+      checkArgument(sourceFile.exists(),
+              "Source file does not exist: %s", sourceFile);
+      checkArgument(offset >= 0, "Invalid offset %s", offset);
+      long length = sourceFile.length();
+      checkArgument(offset == 0 || offset < length,
+              "Offset %s beyond length of file %s", offset, length);
+      request.setFile(sourceFile);
+      request.setFileOffset(offset);
+    }
+    return request;
+  }
+
+  public UploadPartResult uploadPart(UploadPartRequest request) throws IOException {
+    try {
+      UploadPartResult result =
+              (UploadPartResult) callCOSClientWithRetry(request);
+      return result;
+    } catch (Exception e) {
+      String errMsg = String.format("Current thread: [%d], COS key: [%s], "
+                      + "upload id: [%s], part num: [%d], exception: [%s]",
+              Thread.currentThread().getId(), request.getKey(),
+              request.getUploadId(), request.getPartNumber(), e.toString());
+      handleException(new Exception(errMsg), request.getKey());
+    }
+    return null;
   }
 
   /**
@@ -282,12 +389,19 @@ class CosNativeFileSystemStore implements NativeFileSystemStore {
     return null;
   }
 
-  public void abortMultipartUpload(String key, String uploadId) {
+  public void abortMultipartUpload(String key, String uploadId) throws IOException {
     LOG.info("Abort the multipart upload. COS key: [{}], upload id: [{}].",
         key, uploadId);
-    AbortMultipartUploadRequest abortMultipartUploadRequest =
-        new AbortMultipartUploadRequest(bucketName, key, uploadId);
-    cosClient.abortMultipartUpload(abortMultipartUploadRequest);
+    try {
+      AbortMultipartUploadRequest abortMultipartUploadRequest =
+          new AbortMultipartUploadRequest(bucketName, key, uploadId);
+      cosClient.abortMultipartUpload(abortMultipartUploadRequest);
+    } catch (Exception e) {
+      String errMsg = String.format("Current thread: [%d], COS key: [%s], "
+                      + "upload id: [%s], exception: [%s]",
+              Thread.currentThread().getId(), key, uploadId, e.toString());
+      handleException(new Exception(errMsg), key);
+    }
   }
 
   /**
@@ -719,6 +833,12 @@ class CosNativeFileSystemStore implements NativeFileSystemStore {
         } else if (request instanceof ListObjectsRequest) {
           sdkMethod = "listObjects";
           return this.cosClient.listObjects((ListObjectsRequest) request);
+        } else if (request instanceof  ListMultipartUploadsRequest) {
+          sdkMethod = "listMultipartUploads";
+          return this.cosClient.listMultipartUploads((ListMultipartUploadsRequest) request);
+        } else if  (request instanceof InitiateMultipartUploadResult) {
+          sdkMethod = "initiateMultipartUpload";
+          return this.cosClient.initiateMultipartUpload((InitiateMultipartUploadRequest) request);
         } else {
           throw new IOException("no such method");
         }
